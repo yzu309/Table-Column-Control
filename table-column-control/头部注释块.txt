@@ -1,0 +1,576 @@
+/**
+ * 表格列宽控制插件 - 核心设计总结与注意事项（重构版 v7）
+ * 后续修改代码时，绝对，必须，依照此注释比对数据流与工作逻辑，并将新修改点写入对应注释并特殊标记！
+ * 更新此注释块时，不得尝试进行任何省略，回复前必须检查是否进行了省略。如果有省略，直接删除回复，重新构思回复。
+ * -----------------------------------------------------
+ * 
+ * 【数据结构】
+ * - 磁盘数据 (data.json):
+ *   settings.columnWidths: {
+ *     [filePath]: {
+ *       [tableIndex: string]: {
+ *         fingerprintB: string[],   // 排序后的完整标题数组 (null 表示空标题，使用完整标题不截断)
+ *         colWidths: number[],      // 顺序列宽数组 (1 代表自适应)，所有值均为整数
+ *         widths: {                 // 标题 => 列宽数组 (处理同名标题/空标题)
+ *           [title | "null"]: number[]
+ *         }
+ *       }
+ *     }
+ *   }
+ * - 内存数据 (plugin.tableMemory):
+ *   结构与磁盘相同，编辑时所有操作均在内存进行，通过防抖同步回磁盘。
+ *   当文件关闭时，无条件将内存数据写入磁盘并释放内存；下次打开从磁盘重新加载。
+ *   从 this.settings.columnWidths 获取权威数据，避免 I/O 延迟。
+ *   **权威数据库是列宽数据的唯一源头。覆写数据整合包仅作为视图级缓存。**
+ *   **内存权威数据中每个表格额外包含 `lastFpd: string[]` 字段，用于存储上次扫描时的原始标题数组（指纹D），**
+ *   以便在指纹B不变的情况下检测列顺序变化（移动列）。
+ *   **所有列宽值均为整数**，在写入权威数据前进行 Math.round，在计算显示宽度时保持整数，避免浮点精度导致的重复写入死循环。
+ *   **维护模式（新窗口）中仅禁止拖拽引起的直接列宽修改**；源码扫描触发的匹配迁移、列宽重建、数据补全等内存更新以及后续的磁盘保存均可正常执行。
+ *   **精确匹配时的数据一致性保证**：在 matchAndMigrateTablesForFile 中，当通过短指纹C精确匹配成功时，
+ *   会使用当前表格的标题顺序（fpd）和权威列宽数组调用 buildWidthsFromColWidths 重新生成 widths 映射，
+ *   确保 widths 与 colWidths 完全一致，修复手动修改 data.json 后可能出现的 widths 缺失或不一致问题。
+ * 
+ * - 孤儿池 (plugin.orphanedTableData):
+ *   Map<filePath, Map<fingerprintC_json, {fingerprintB, colWidths, widths, timestamp}>>
+ *   用于临时保存被删除/剪切表格的数据，5分钟内可通过短指纹C恢复宽度。
+ *   **新窗口（维护模式）中允许进行孤儿池的读写**（因为已允许源码扫描引起的全量内存更新，孤儿池包含在内）。
+ * 
+ * - 覆写数据整合包 (plugin._overwritePackages):
+ *   Map<cmView, Map<number, { widths: number[], totalFixedWidth: number }>>
+ *   每个视图独立一份。存储各表格动态序号对应的最终显示列宽数组（顺序，已包含自适应补偿）以及该表格的固定总宽度。
+ *   由列宽应用扫描器直接使用。维护模式也允许更新本视图的覆写包，保证展示正确。
+ *   - widths: 顺序显示列宽数组，已包含自适应补偿，全部为整数值，直接用于设置各列宽度。
+ *   - totalFixedWidth: 表格的显示总宽度（整数）。计算规则：
+ *     1. 基于权威数据 colWidths 计算固定列宽总和 fixedSum（所有列宽均为整数，若为 1 则通过 fetchActualColumnWidth 获取实际渲染宽度后取整替换）。
+ *     2. 若开启了自适应铺满 (autoFit) 且编辑区宽度 > fixedSum，则 totalFixedWidth = 编辑区宽度；
+ *        否则 totalFixedWidth = fixedSum。
+ *     这确保了覆写包中的总宽度与实际写入的列宽总和完全一致，消除 min-width 与显示宽度冲突导致的交替写入死循环。
+ *   清空触发：编辑器宽度变化（仅本视图）、文档表格数量变化、表格列数变化、列顺序变化、拖拽后调用 invalidateOverwritePackageForFile 清除其他视图的包并立即触发一次列宽应用（一次性的 processEditorTables 调用，不改变扫描器模式）。
+ *   源码扫描期间，若检测到列结构变化（数量或顺序），会立即清空当前视图的覆写包，确保列宽应用扫描器重算。
+ *   **数据回写**：从磁盘恢复列宽数据时，必须同时写回权威内存数据库，确保权威数据始终可用，即使覆写包被清空也能重新构建。
+ *   **跨视图失效仅限相同文件**：invalidateOverwritePackageForFile 只会清空属于同一文件的其他视图缓存，不会误删其他文件的覆写包。
+ * 
+ * - 拖动锁 (_dragLock):
+ *   { cmView, tableIndex } | null
+ *   记录当前正在拖动的表格所属视图及动态序号。拖动开始时设置，拖动结束时清除。
+ *   列宽应用扫描器在覆写前询问此锁，若为当前表格则跳过覆写，以避免拖拽过程中的闪烁。
+ *   **拖拽行为已恢复为即时响应，移除悬停激活机制。指针按下即启动拖拽。**
+ * 
+ * - 覆写数据等待队列 (_pendingOverwriteResolvers) [已完全移除]:
+ *   该机制在历史版本中用于在拖拽期间挂起扫描器等待数据，现已不再使用。
+ *   扫描器通过询问拖动锁 (isTableDragging) 跳过拖拽中的表格，并在松手后由 processEditorTables 即时应用列宽。
+ * 
+ * - 编辑区尺寸观察者 (_resizeObservers):
+ *   Map<HTMLElement, ResizeObserver>  监控每个 markdown 视图的 .cm-sizer 尺寸变化，
+ *   当编辑区宽度改变时清空当前视图的覆写包并触发重绘。
+ *   **主窗口有效；新窗口（维护模式）可能因 DOM 结构不同而无法触发，不再由列宽应用扫描器补检（该职责已移除）。**
+ * - 尺寸变化防抖定时器 (_resizeDebounceTimers):
+ *   Map<HTMLElement, number>  用于对 ResizeObserver 回调进行防抖，避免频繁触发列宽重设。
+ * 
+ * - 拖拽状态锁 (_isDragging):
+ *   boolean 标记当前是否有列宽拖拽操作正在进行。拖拽开始设为 true，结束设为 false。
+ *   源码扫描器会检查此标志，若为 true 则跳过本次扫描。
+ *   **拖拽期间列宽应用扫描器完全挂起**：`processEditorTables` 入口若检测到 `_isDragging === true` 则直接返回，
+ *   防止旧的异步覆写计算污染新列宽。
+ *   **重要**：`_isDragging` 的重置位于 `attachDragBehavior` 的 `onUp` 回调中，在 `try...finally` 块之后执行。
+ *   这确保了即使拖拽被锁定（isDragLocked 返回 true），扫描器也能恢复正常工作。
+ * 
+ * - 分隔行缓存 (_rowNumbersCache):
+ *   Map<filePath, { rowNumber: number, isNormalTable: boolean }[]>
+ *   **文件级别**缓存，同一文件的所有视图共享。存储最近一次源码扫描得到的表格分隔行信息（行号及是否为普通表格）。
+ *   用于确定表格序号以及判断是否需要在实时预览模式下应用列宽。
+ *   **注意**：数组中元素为对象，使用 .rowNumber 获取行号；所有遍历该缓存的函数已适配此结构。
+ *   **isNormalTable** 判断为行首第一个字符是否为 `|`（即 line[0] === '|'），符合设计中对普通表格的定义。
+ * 
+ * - 源码扫描状态 (_sourceScanStates):
+ *   Map<cmView, { lastRowNumbers: ... , initialMatchDone, firstEditOccurred, lastTotalLines, lastTotalChars, ... }>
+ *   记录每个视图的源码扫描相关状态，如上次行号、文档行数、是否已完成首次匹配等。
+ *   源码扫描由 editor-change 事件驱动，无定时循环。经测试验证，移动列操作会触发 editor-change 事件，因此移动列会被正常捕获并处理。
+ *   **扫描过程中设置 `_sourceScanBusy = true`，阻止列宽应用扫描器覆写；扫描结束后恢复。**
+ *   **【重要更新】源码扫描器仅活跃窗口可执行**：`performSourceScan` 入口会检查当前 cmView 是否属于 `workspace.activeLeaf`，
+ *   非活跃窗口（例如分屏的另一半、新窗口已失去焦点）的扫描直接跳过，避免重复的匹配迁移、覆写包清空等操作。
+ * 
+ * - 源码扫描忙碌标志 (_sourceScanBusy):
+ *   boolean  源码扫描期间为 true，禁止列宽应用扫描器覆写数据。
+ * 
+ * - 源码扫描休眠状态 (plugin._dormantStates):
+ *   Map<filePath, { mode: 'active'|'dormant', dormantBaseLines: number, accumulatedChange: number }>
+ *   文件级别的休眠机制。当文档分隔行数量为 0 时进入 dormant 模式，停止由 editor-change 驱动的源码扫描，
+ *   改为累计行数变化；累计变化 ≥3 时临时唤醒一次扫描，若发现表格则切回 active，否则保持 dormant。
+ *   仅当前活跃视图的 editor-change 触发此逻辑，非活跃视图不影响计数。
+ *   文件关闭时删除对应的休眠状态。
+ * 
+ * - 列宽应用扫描器状态 (_applyScanStates):
+ *   Map<cmView, { mode: 'high'|'normal'|'low'|'idle', timer: number, emptyTableCount: number, lastActiveTime: number, lastWinIdentity: boolean|undefined, stableCount: number,
+ *                _pendingLowMode: boolean, _lastTotalCharsForLow: number, _lowModeCheckCount: number, _highTimer: number|null, _cleanup: ()=>void }>
+ *   每个视图独立调度，负责定时检查视口内表格并应用列宽。
+ *   扫描模式说明:
+ *   - high:   高效模式，每 100ms 扫描一次。用于页面激活、滚动、光标在表格内点击、拖拽列宽等。
+ *             已支持 high 模式刷新：调用 _setApplyScanMode 传入 'high' 时即使当前已是 high 也会重置高效计时器和扫描间隔，确保拖拽等场景得到即时高频响应。
+ *   - normal: 常规模式，每 1s 扫描一次。高效计时器到期后降级。
+ *   - low:    低效模式，每 3s 扫描一次。仅在确认文档无大幅变化后进入。当视图失去焦点时（active-leaf-change），若当前为 high/normal 则降为 low，保持分屏场景下非活动视图仍能低频维护列宽。
+ *   - idle:   待机模式，停止扫描。仅在连续10次扫描未发现表格时进入。视图失去焦点不会直接进入 idle，避免分屏时无法恢复列宽。
+ *   手柄同步前置：每次处理表格时先根据窗口身份同步拖拽手柄，无需等待覆写数据。
+ *   **低效模式延迟降级**：检测到实质编辑后，不立刻降为 low，而是进入待确认状态 (_pendingLowMode)。
+ *     在后续两次扫描中比较文档总字符数变化，只有连续两次变化量均小于13字符时才最终降为 low。
+ *     这确保新建/删除行列等大幅操作期间保持高频扫描，列宽及时恢复。
+ *   **编辑后即时列宽覆写**：editor-change 事件额外用 requestAnimationFrame 调用一次 processEditorTables，
+ *     使列宽立即恢复，不再等待扫描周期，消除闪烁。
+ *   **覆写包清空后的一次性列宽应用**：invalidateOverwritePackageForFile 在清空其他视图覆写包后，立即通过 requestAnimationFrame 调用一次 processEditorTables，但不会改变被调用视图的扫描模式。
+ *   **拖拽过程中的扫描强化**：
+ *     - 拖拽开始时（onPointerDown）强制将扫描模式提升为 high，保证拖动时列宽实时响应。
+ *     - 拖拽结束时（onUp）通过 requestAnimationFrame 立即调用 processEditorTables 恢复表格宽度锁定，并再次将扫描模式提升为 high，启动 1s 降级计时器。
+ * 
+ * - 常规模式加载标志 (_regularModeLoaded):
+ *   boolean  标记常规模式所需的额外功能（如文件关闭检测）是否已加载。
+ *   插件启动时进入维护模式，待首次确认存在主窗口叶子后，才加载这些功能，且仅加载一次。
+ *   **若 onLayoutReady 时未加载（例如当时无主窗口），则后续在 processEditorTables 或 active-leaf-change 中检测到主窗口叶子时进行补加载。**
+ *   **注意：_regularModeLoaded 不再限制数据保存或源码扫描更新，仅控制主窗口专属的文件关闭检测等功能。**
+ * 
+ * - 日志控制相关:
+ *   _migrationLoggedFiles: Set<filePath>  记录已完成首次全量匹配迁移日志输出的文件，避免重复日志。
+ *   _lastDynamicInfo: Map<filePath, { tableCount: number, titles: string[][] }>
+ *     记录每个文件上次的动态序号映射（表格序号 → 源码标题数组），用于判断是否需要输出动态序号变化日志。
+ *   _perfStats: { scanCycle: number, processEditorTables: number, fileSaveScheduled: number, matchMigrate: number, autoFitReplace: number }
+ *     调试模式下的性能计数器，每 5 秒通过 dataLog 输出聚合值并重置，用于观察插件自身活动频率。
+ *   _missingLogged: Map<filePath, Set<tableIndex>>  用于 MISS 日志去重，每个缺失表格仅输出一次日志。
+ * 
+ * - 实际渲染宽度按需阻塞查询函数 (fetchActualColumnWidth):
+ *   独立的按需阻塞查询函数，由插件主体在需要获取某列实际渲染宽度时主动调用，非定时循环。
+ *   工作流程：
+ *     1. 插件主体传入目标表格的动态序号和列索引。
+ *     2. 函数遍历当前视口内所有 <table>，通过 getTableIndexFromDOM 匹配目标表格。
+ *     3. 若匹配成功，读取对应 <col> 的 getBoundingClientRect().width 并返回（取整）。
+ *     4. 若表格不在视口中，函数不会无限循环查找，而是注册一个 MutationObserver 监听新表格的添加，
+ *        或与列宽应用扫描器协作，在下一个表格出现时判断身份。一旦目标表格出现，立即返回其列宽。
+ *        等待期间不消耗额外 CPU，调用方（getOrComputeOverwritePackage）通过 await 阻塞，直到获取到宽度后才继续计算。
+ *     5. 每次调用只查询一个列，绝不接收动态序号数组，确保调用栈简单可靠。
+ *     6. 返回值为整数（Math.round），该函数同时被用于自适应替换：当权威数据中某列值为 1 时，调用此函数获取实际渲染宽度后直接替换权威数据中的 1。
+ * 
+ * 
+ * 【表格序号与身份识别】
+ * - 序号: 根据分隔行 (| - 等) 在文档中从上到下确定，从1开始。
+ *   行号仅用于确定序号，**确定后立即丢弃，绝不与表格身份绑定**。
+ * - 身份: 由标题行的指纹B (排序后的完整标题) 唯一决定。
+ *   匹配时使用短指纹C (指纹B去除null值) 进行精确比对。
+ * - **动态序号定位**:
+ *   使用 `cmView.posAtDOM(table)` 获取表格起始行，在 `_rowNumbersCache` 中查找到分隔行行号，
+ *   从而确定动态序号。该方式完全免疫 CodeMirror 虚拟滚动导致的 DOM 顺序与源码顺序不一致问题。
+ *   "能看到" = "能定位"，任何已渲染的表格都能立即获得正确的列宽数据。
+ *   表格总数和列数均未变化时可跳过短指纹C匹配，直接用序号取数据，提升性能。
+ * 
+ * - **表格识别升级**：
+ *   `scanTableRowNumbers` 现在返回 `{ rowNumber: number, isNormalTable: boolean }[]`。
+ *   通过定位行中第一个 '|' 并检查其后紧随的字符判断是否为分隔行。
+ *   `isNormalTable` 为 `true` 表示该表格在实时预览模式下会渲染为 table 元素，需应用列宽；
+ *   非普通表格（如引用块表格、缩进表格）在实时预览下无 table 元素，但仍需在 data 中保留数据块。
+ *   **isNormalTable 判断已修正为 `line[0] === '|'`，精确检测行首字符，与设计一致。**
+ * 
+ * 
+ * 【编辑模式数据流与源码扫描器职责】
+ * 1. 源码扫描由 `editor-change` 事件驱动，不再使用定时循环。
+ *    经测试验证，移动列操作会触发 `editor-change` 事件，因此移动列会被源码扫描器正常捕获并处理。
+ *    editor-change 触发 → 通过 `requestAnimationFrame` 合并 → 执行 `performSourceScan`：
+ *    - 读取 doc.toString()，调用新版 `scanTableRowNumbers` 更新 `_rowNumbersCache`（文件级）。
+ *    - 提取数据1（分隔行行号）、数据2（表格标题数组/指纹D/指纹B/短指纹C）、数据3（总行数）。
+ *    - 比对分隔行数量变化，标记 `structureChanged`。
+ *    - 若 structureChanged 或 initialMatchDone 为 false，执行全量 `matchAndMigrateTablesForFile` 并补全数据，同时移除所有表格 min-width、清空当前视图覆写包并失效其他视图覆写包。
+ *    - 若结构未变，则逐个表格更新指纹，比较新旧指纹B长度检测列数变化，比较新旧指纹B内容及 `mem.lastFpd` 检测列顺序变化。
+ *      - 列数变化：调用 `rebuildColWidthsFromWidthsMap` 重建顺序列宽，标记 `anyColCountChanged = true`。
+ *      - 指纹B内容相同时，检测 `lastFpd` 是否变化：若顺序不同，调用重建列宽并标记 `anyOrderChanged = true`（处理移动列）。
+ *      - **指纹B内容不同时，仅更新内存中的 `fingerprintB` 和 `widths` 映射，不触发列宽重建，不标记任何变化标志。**
+ *      - 任何情况下都更新 `mem.widths` 映射、`mem.fingerprintB` 和 `mem.lastFpd`。
+ *    - 若 anyColCountChanged 或 anyOrderChanged 为 true，移除所有表格 min-width、清空当前视图覆写包并失效其他视图覆写包，触发持久化。
+ *    - 扫描结束后，进行数据完整性检查：为所有当前表格补全缺失的内存数据块（仅添加缺失序号，不覆盖已有数据），补全后同步 settings 并保存。
+ *    - 扫描期间设置 `_sourceScanBusy = true`，阻止列宽应用扫描器覆写；扫描结束后恢复。
+ *    - 更新 `_lastDynamicInfo` 等辅助信息。
+ *    - **不调用** processEditorTables。
+ * 2. 源码扫描休眠：
+ *    - 当文件分隔行数量为 0 时，文件进入 dormant 模式，`editor-change` 不再触发扫描。
+ *    - 编辑时累加行数变化（基于文件级 `_dormantStates`），累计 ≥3 时临时执行一次扫描检查是否有表格出现，有则切回 active，无则重置参数保持 dormant。
+ *    - 休眠状态为文件级，仅活跃视图的编辑事件驱动，非活跃视图不影响。
+ * 3. 列宽应用扫描器完全独立，每个视图一个 `_applyScanStates`，按模式定时执行：
+ *    - 拖拽期间挂起：若 `_isDragging === true`，直接返回，不扫描。
+ *    - 扫描视口内 `<table>`，通过 `getTableIndexFromDOM` 获取动态序号（内部使用 `getTableIndexByStartLine`，已适配 `.rowNumber`）。
+ *    - **手柄同步前置**：在请求覆写数据之前，确保主窗口表格有手柄，新窗口无手柄。无论覆写数据是否存在，手柄均已就绪。
+ *    - 检查 `_sourceScanBusy`，若为 true 则跳过该表格。
+ *    - 从本视图的覆写整合包中取得显示列宽和固定总宽度 `{ widths, totalFixedWidth }`，若无则按需计算（调用 `getOrComputeOverwritePackage`）。
+ *      · 若 `tableMemory` 中缺失当前表格，但 `settings` 中有该文件的数据，则一次性加载该文件的所有表格数据到内存，避免后续同步丢失其他表格。
+ *      · 该计算过程可能调用 `fetchActualColumnWidth` 阻塞等待表格渲染并获取实际列宽（取整），完成自适应替换。
+ *      · 计算 totalFixedWidth 时，先得出固定列宽总和，若开启自适应铺满且编辑区宽度更大，则取编辑区宽度，否则取固定总和。
+ *    - 询问拖动锁，若表格正在拖动则跳过覆写。
+ *    - 统计扫描到的 table 数量，若连续 10 次为 0 则进入 idle 模式并通知源码扫描可暂停。
+ *    - **表格宽度锁定**：在 `applyWidthsToTable` 中根据 `totalFixedWidth` 和是否启用自适应铺满，设置表格的 `min-width` 和 `width` 样式（均为整数 px），防止浏览器因容器宽度不足而压缩列宽。
+ *    - **拖拽时临时解锁宽度**：在 `attachDragBehavior` 的 `onMove` 中，拖拽列宽时强制将表格的 `min-width` 置为 `0` 和 `width` 置为 `auto`，解除宽度锁定以保证拖拽跟手。松手后列宽应用扫描器会重新锁定。
+ * 4. 窗口身份检测、frontmatter 指令检查等逻辑保持不变，但调用时机统一由扫描器决定。
+ * 5. 按需保存：`scheduleFileSave` 在列宽数据发生实际变更时调用（拖拽结束、首次自适应替换、结构迁移完成、列数/顺序变化、数据补全等，现在也包括新窗口中的这些事件）。防抖延迟改为 6 秒。定时器到期直接调用 saveSettings 持久化。
+ * 6. 文件关闭检测延迟改为 3 秒。
+ * 7. **编辑后即时列宽覆写**：editor-change 事件额外通过 requestAnimationFrame 调用一次 processEditorTables，
+ *    使列宽在编辑后立即恢复，不再等待扫描周期，消除新建行列等操作导致的闪烁。
+ * 8. **拖拽行为已恢复为旧版即时响应**：移除悬停激活延迟，指针按下即启动拖拽流程，onMove 中基于按下时的初始宽度计算新列宽，并临时解除表格宽度锁定；onUp 中可靠保存并释放锁。所有保存宽度均为整数。
+ * 9. **权威数据库回写**：`getOrComputeOverwritePackage` 在从磁盘恢复列宽数据后，必须同时写回权威内存数据库，确保覆写包被清空时权威数据仍可用。现在新窗口同样执行此回写。
+ * 10. **分屏维护**：`active-leaf-change` 时将其他视图降为 low（而非 idle），保证非活动视图的列宽仍能被低频维护，避免 DOM 重建后列宽永久丢失。
+ * 11. **自适应替换与总宽度计算整合**：在计算覆写包时，若某列权威数据为 1，通过 `fetchActualColumnWidth` 获取实际渲染宽度（取整）并立即替换权威数据中的 1，
+ *     同时将该宽度用于计算固定列宽总和。然后根据自适应铺满规则确定最终的 totalFixedWidth。新窗口中同样执行此替换并保存。
+ * 12. **全列宽数据整数化**：权威数据、覆写包中的 widths 数组、totalFixedWidth、DOM 写入的列宽值均强制为整数。在写入前进行比较时也转为整数比较，彻底杜绝浮点精度导致的重复写入死循环。
+ * 13. **覆写包清空后的一次性列宽应用**：拖拽或结构变化导致其他视图覆写包被清空时，通过 requestAnimationFrame 调用一次 processEditorTables，使列宽立即刷新，但不会改变扫描器的模式状态（idle 保持 idle，low 保持 low）。
+ * 14. **拖拽时解除表格宽度锁定**：拖拽过程中在 `onMove` 里将表格的 `min-width` 设为 `0`、`width` 设为 `auto`，保证向左拖拽最右侧列时表格也能自由收缩。松手后由列宽应用扫描器重新锁定。
+ * 15. **跨视图覆写包失效仅限相同文件**：`invalidateOverwritePackageForFile` 只清除指定文件路径的其他视图缓存，防止误删其他文件的视图缓存，避免不必要的全量重算和界面闪烁。
+ * 16. **视图卸载资源清理**：新增 `cleanupView` 函数，在视图断开连接时统一清理覆写包、源码扫描状态、列宽应用扫描状态、ResizeObserver、事件监听器等视图独有资源，防止内存泄漏。文件级资源（分隔行缓存、休眠状态等）由文件关闭流程处理。
+ * 17. **拖拽时扫描模式增强**：
+ *     - 拖拽开始时通过 `_setApplyScanMode` 提升为 `high`，并支持重复刷新高效计时器。
+ *     - 拖拽结束后立即通过 `requestAnimationFrame` 调用 `processEditorTables` 恢复表格宽度锁定，并重新提升为 `high` 以启动 1s 降级计时器。
+ * 18. **已移除的旧机制**：`_pendingOverwriteResolvers` 等待队列已完全移除，不再使用。`setupTableResize` 及 `findMemoryIndexByFingerprint` 函数均已删除。`buildColWidthsFromMemory`、`_updateOverwritePackage`、`refreshAndSyncFile` 也已移除。
+ * 
+ * 
+ * 【维护模式与常规模式】 (重大更新 7：放宽维护模式限制)
+ * - 插件实例唯一，不会在新窗口中重复运行。通过 `leaf.getRoot() === this.app.workspace.rootSplit` 判断每个视图的窗口身份。
+ * - **维护模式**（当前视图位于新窗口/弹出窗口）：
+ *   · 允许读取内存/磁盘中的列宽数据，正常应用列宽和自适应铺满计算。
+ *   · 允许更新本视图的覆写整合包（因为是展示缓存）。
+ *   · **允许源码扫描引起的所有内存更新**：匹配迁移、列宽重建、数据补全、孤儿池读写等（原完全禁止，现已开放）。
+ *   · **允许保存数据到磁盘**：源码扫描后触发的 `syncTableMemoryToSettings` 和 `scheduleFileSave` 均可正常执行。
+ *   · **禁止拖拽引起的直接列宽修改**：拖拽手柄被移除，且 `attachDragBehavior` 入口处有窗口身份拦截（应使用 `isMainWindowLeaf` 精确判断，目前实现暂用全局变量 `_currentMainWin`，后续将统一为视图级检查）。
+ *   · 依然运行扫描器、ResizeObserver，但所有拖拽写入路径被拦截。
+ *   · 列宽应用扫描器同样工作，但只从覆写包读取数据，不会回写内存。
+ * - **常规模式**（当前视图位于主窗口）：
+ *   · 完整的读写权限，可编辑内存、保存磁盘、匹配迁移、操作孤儿池、拖拽调整列宽。
+ *   · 正常添加拖拽手柄，允许拖拽调整列宽。
+ *   · 所有写入操作均受硬性防护：任何从非主窗口叶子触发的拖拽写入调用将被无条件丢弃。
+ * 
+ * 
+ * 【常规模式额外功能（延迟加载）】
+ * - 插件启动时无论身份如何，均以维护模式运行，注册所有基础事件。
+ * - 当首次检测到主窗口叶子时，加载以下额外功能，并通过 `_regularModeLoaded` 标志确保仅执行一次：
+ *   1. 文件关闭检测（监听 active-leaf-change，管理 _pendingCloseTimers，释放文件内存并写入磁盘，延迟 3s 确认）。
+ *   2. 建立 _activeFilePaths 集合，追踪主窗口内打开的 markdown 文件路径。
+ * - **若 onLayoutReady 遍历时未发现主窗口叶子，则后续在 processEditorTables 或 active-leaf-change 中一旦发现即补加载，确保常规模式功能绝不遗漏。**
+ * 
+ * 
+ * 【窗口身份检测方法】
+ * - 使用 `leaf.getRoot() === this.app.workspace.rootSplit` 进行 100% 准确判断。
+ * - 主窗口叶子：其根为 workspace.rootSplit，返回 true。
+ * - 新窗口叶子：其根为 workspace.floatingSplit（或其他分离容器），返回 false。
+ * 
+ * 
+ * 【主窗口硬性防护】
+ * - 所有拖拽相关的数据修改函数入口处，必须检测当前操作是否来自主窗口叶子，应使用 `isMainWindowLeaf` 精确判断。
+ *   目前 `attachDragBehavior` 中因历史原因使用了全局变量 `_currentMainWin`，计划后续修正为视图级判断。
+ * - 包括 `attachDragBehavior` 的 `onUp` 中的保存部分。
+ * - 非主窗口调用时直接返回，不做任何拖拽保存操作。
+ * 
+ * 
+ * 【匹配迁移 matchAndMigrateTablesForFile】  (所有窗口均可执行)
+ * - 权威数据来源: 优先内存 tableMemory，否则从 settings 读取。
+ * - 对每个当前表格依次匹配:
+ *   ① 精确匹配短指纹C (允许重复使用，解决复制表格)
+ *   ② 孤儿池匹配 (去重 Map，键为短指纹C)
+ *   ③ 序号回退 (仅当该序号未被匹配过)
+ * - 匹配成功时直接复制权威数据的 colWidths 数组 (截断或补1)，并初始化 `lastFpd`。
+ *   **精确匹配时，使用当前表格的标题顺序（fpd）调用 `buildWidthsFromColWidths` 重建 widths 映射，确保 widths 与 colWidths 一致。**
+ * - 未被匹配的权威数据移入孤儿池，刷新时间戳。
+ * - 清理超过5分钟的孤儿数据。
+ * - **主窗口和新窗口均可执行此流程**（已移除窗口身份检查）。
+ * - 日志输出: 每个文件仅在第一次执行完整匹配时输出详细日志（MATCH START ... MATCH END），
+ *   之后该文件的所有匹配迁移不再输出日志，除非文件关闭后重新打开（从 _migrationLoggedFiles 移除）。
+ * - **执行完成后，将触发 scheduleFileSave 以持久化迁移后的列宽数据。**
+ * 
+ * 
+ * 【宽度应用 applyWidthsToTable】[强制固定列宽，锁定表格总宽度，全整数]  -- 模式感知
+ * - 文件视图:
+ *   - 应用列宽前先比较当前样式（转为整数比较），相同则跳过，防止重排跳动和浮点精度死循环。
+ *   - 列数变化: 从 widths 映射重建 colWidths。
+ *   - 自适应铺满:
+ *     · 计算补偿时基于当前视图的 editorWidth，结果存入本视图的覆写整合包，所有宽度均为整数。
+ *   - 常规模式：添加拖拽手柄，允许调整列宽。
+ *   - 维护模式：强制移除所有拖拽手柄，并设置 locked = true。
+ *   - locked 为 true 时，禁止拖动 (不添加手柄)，且不会保存拖拽产生的新宽度。
+ *   - **表格宽度锁定**：根据覆写包提供的 totalFixedWidth 和是否启用自适应铺满：
+ *     - 设置 `table.style.minWidth` 为 totalFixedWidth（!important，整数 px），防止压缩。
+ *     - 设置 `table.style.width`：若自适应模式且编辑区宽度大于总固定宽度，设为编辑区宽度；否则设为 totalFixedWidth（均为整数 px）。
+ *   - **维护模式下，从磁盘恢复列宽数据时创建 mem 对象用于当前应用，并可正常写入 tableMemory（已放宽）。**
+ *   - **自适应替换已整合到 totalFixedWidth 计算中，不再需要单独的 allowReplaceOnes 步骤。所有宽度值在进入覆写包前已完成整数化。**
+ *   - **拖拽过程中的临时解锁**：拖拽时由 `attachDragBehavior` 的 `onMove` 强制将 `min-width` 置 `0`、`width` 置 `auto`，保证拖拽跟手。松手后下次 `applyWidthsToTable` 重新锁定。
+ * - 侧边栏临时模式: 不保存任何数据，不参与自适应铺满。
+ * 
+ * 
+ * 【自适应铺满计算方式与易错点】
+ * - 替换策略: 已经完全移除单独的 allowReplaceOnes 逻辑。当权威数据中某列值为 1 时，
+ *   在计算 totalFixedWidth 的过程中通过 fetchActualColumnWidth 获取该列的实际渲染宽度（取整），
+ *   并直接用该值替换权威数据中的 1。该过程同时完成自适应初始化和总宽度计算。
+ * - 计算补偿量: totalWidth = sum(adjustedColWidths)，compensation = max(0, editorWidth - totalWidth)
+ * - 易错点：editorWidth >= 100px；拖动结束 skipAuthority=true 强制重算并更新数据库。
+ * - 不再由列宽应用扫描器补检编辑器宽度变化（已移除该逻辑，ResizeObserver 已覆盖）。
+ * 
+ * 
+ * 【表格静默扫描 (处理虚拟滚动)】
+ * - 使用主动查找 + 行号定位，通过 `cmView.dom.querySelectorAll("table")` 获取视口内表格。
+ * - 动态序号定位：`cmView.posAtDOM(table)` + 行号缓存（文件级）。
+ * - 列宽应用扫描器负责补漏，维护/常规模式均运行。
+ * 
+ * 
+ * 【源码扫描状态机 (Source Scan)】
+ * - 源码扫描仅由 editor-change 驱动，无定时循环。经测试验证，移动列操作会触发 editor-change 事件，因此移动列会被正常捕获并处理。
+ * - **严格限制在活跃窗口**：`performSourceScan` 入口检查 `cmView` 是否属于 `workspace.activeLeaf`，非活跃视图直接跳过，避免分屏或新窗口失去焦点时的重复扫描、覆写包清空。
+ * - 文件级休眠：若分隔行数量为 0，进入 dormant 模式，停止扫描，累计行数变化 ≥3 时唤醒检查；有表格则切回 active。
+ * - 打开文档或切换至某视图时，若 `doc.lines < 3`，完全不启动任何扫描器；当行数增长到 ≥3 时再启动。
+ * - `initialMatchDone` 为 false 时，首次扫描必须执行 matchAndMigrateTablesForFile。
+ * 
+ * 
+ * 【列宽应用扫描器状态机 (Apply Scan)】
+ * - 模式切换规则:
+ *   1. 视图激活 / 滚动 / 光标点击在表格内: mode = 'high'，启动 1s 高效计时器。
+ *      (已支持 high 模式重复刷新，每次拖拽、滚动等事件均可安全地重新调用 _setApplyScanMode('high') 以重置计时器和间隔。)
+ *   2. 高效计时器到期: mode = 'normal' (1s 间隔)。
+ *   3. 实质编辑 (editor-change) 后不立即降级，而是进入低效模式待确认状态 (_pendingLowMode=true)。
+ *      在后续两次扫描中，若连续两次字符数变化量均小于13，则切换到 low；否则保持原模式继续检查。
+ *   4. 视图失去焦点: 不进入 idle，而是将模式降为 low（若当前为 high/normal），保证分屏场景下仍能低频维护列宽。
+ *   5. 连续 10 次扫描未发现表格: mode = 'idle'，同时通知源码扫描可暂停（若源码也无表格）。
+ *   6. 从 idle 唤醒: 回到 high。
+ *   7. 切换至 high 或 idle 时清除 _pendingLowMode 标记。
+ *   8. 覆写包清空后的一次性列宽应用（通过 invalidateOverwritePackageForFile）不会改变扫描模式。
+ *   9. 拖拽行为强制干预：拖拽开始时强制提升为 high，拖拽期间扫描器挂起（不遍历表格），拖拽结束时再次提升为 high 并立即执行一次 processEditorTables 恢复宽度锁定。
+ * - 每次周期扫描到 table 后:
+ *   - 先同步手柄（添加/移除），主窗口表格无论有无列宽数据均立即拥有手柄。
+ *   - 检查源码扫描忙碌标志，忙碌则跳过。
+ *   - 获取起始行 → 动态序号。
+ *   - 从本视图覆写包获取显示列宽和固定总宽度 `{ widths, totalFixedWidth }`，若无则按需计算。
+ *     计算过程可能通过 fetchActualColumnWidth 阻塞等待表格渲染并获取实际列宽（取整）。
+ *   - 等待拖动锁释放（若正在拖动当前表格，则跳过本次覆写）。
+ *   - 覆写列宽并锁定表格总宽度（比较现有样式时使用整数比较，相同则跳过）。
+ * 
+ * 
+ * 【持久化流程】
+ * - 所有权威内存数据变动后，先调用 `syncTableMemoryToSettings` 将指定文件的 `tableMemory` 同步到 `this.settings.columnWidths`，再调用 `scheduleFileSave` 安排防抖写入磁盘。
+ * - `scheduleFileSave` 定时器到期直接执行 `saveSettings`，不再通过其他中间函数。
+ * - 文件关闭时 `releaseFileMemory` 同样先同步后保存。
+ * - 所有写入均通过 settings 中转，无任何绕过防抖的直接写盘。
+ * - **主窗口和新窗口均享有完整的持久化权限**（拖拽保存除外）。
+ * 
+ * 
+ * 【日志优化策略】
+ * - 强制日志 (不受 debugMode 控制，始终输出):
+ *   1. 窗口身份变化日志: 每个视图在 processEditorTables 中，当本次窗口身份与 ScanState 中记录的 lastWinIdentity 不同（或首次处理）时，输出 "[TCR-SECURITY] Main/New Window - processing: <filePath>"。以视图为粒度去重。
+ *   2. data.json 读入日志: loadSettings 完成时输出 "Data loaded from disk, files: <count>"。
+ *   3. data.json 写入日志: saveSettings 实际持久化时输出保存的文件路径（目前 saveSettings 无日志，可考虑添加）。
+ *   4. 安全拦截日志: 非主窗口拖拽写入被拦截时强制输出。
+ * - 受 debugMode 控制的日志:
+ *   1. dataLog: 指纹计算、内存读写、匹配迁移详情（首次除外）、列宽应用细节。
+ *   2. cacheLog: 覆写包命中/未命中（MISS 日志已去重，每个缺失表格仅输出一次）。
+ *   3. 扫描模式切换通知: 当列宽应用扫描器的 mode 发生变化时，输出 "[TCR-DATA] Apply scan mode changed: <filePath> -> <mode>"。
+ * - 动态序号日志:
+ *   每次源码扫描后，比对 _lastDynamicInfo 中记录的标题矩阵。仅当表格数量或任一表格的源码标题数组发生变化时，
+ *   输出 "[TCR-DATA] Dynamic index changed for <filePath>:" 及每个表格的序号和标题数组（使用 dataLog，受 debugMode 控制）。
+ * - 指纹匹配/迁移日志:
+ *   matchAndMigrateTablesForFile 仅对每个文件首次执行时输出完整日志 (MATCH START ... MATCH END)，
+ *   后续同文件不再输出。使用 _migrationLoggedFiles 记录。
+ * - 内存数据中转日志:
+ *   tableMemory 写入时 (updateMemoryWidths / 拖拽结束)，使用 dataLog 输出
+ *   "Mem write: <filePath> table <dynamicIndex> titles: [...]"，需实时计算动态序号。
+ * - 性能自检（调试模式）：
+ *   当 debugMode 为 true 时，关键函数启用 console.count 计数。
+ *   每 5 秒通过 dataLog 输出聚合计数 (_perfStats)，观察扫描、保存、迁移、替换频率。正常基准：浏览时 scanCycle ≈ 1次/s，fileSaveScheduled 不应持续增长，matchMigrate/autoFitReplace 仅初始化时触发极少次。
+ * - 列宽覆写日志（调试模式）：
+ *   applyWidthsToTable 中，当列宽即将发生变化时输出 "[TCR-DATA] applyWidthsToTable: table column X current=... setting to ..."，便于追踪列宽复位问题。
+ * 
+ * 
+ * 【已移除的旧功能】
+ * - 跨窗口日志通道 (BroadcastChannel): 因插件实例唯一，无需。
+ * - 定时清除手柄 (setInterval, 2s): 由列宽扫描器每次循环时负责。
+ * - 全局 pointerdown 拦截: 因新窗口已无手柄，多余。
+ * - DOM 侧边栏检测 (isMainWindowByDOM): 由 leaf.getRoot() 替代。
+ * - 旧版 _tableScanTimers: 被 _applyScanStates 替代。
+ * - _displayAuthority 及 autoFitCompensations: 被 _overwritePackages 替代。
+ * - 定时循环源码扫描: 改为事件驱动。
+ * - pointerdown 无条件提升扫描模式: 改为仅当光标位于表格内时才提升。
+ * - 拖拽防误触阈值逻辑: 已完全移除，恢复即时响应。
+ * - 拖拽悬停激活机制: 已移除，恢复指针按下即拖拽。
+ * - 独立的 allowReplaceOnes 自适应替换逻辑: 已整合到 totalFixedWidth 计算中，通过 fetchActualColumnWidth 自动完成。
+ * - 列宽应用扫描器主动检测编辑器宽度变化: 该职责已移除，由 ResizeObserver 覆盖。
+ * - _lastEditState: 未使用的变量已移除。
+ * - setupTableResize: 已被 processEditorTables + applyWidthsToTable + 覆写包机制完全取代，函数定义已移除。
+ * - findMemoryIndexByFingerprint: 不再使用，已移除。
+ * - _pendingOverwriteResolvers: 拖拽期间的等待队列已移除，现通过跳过拖拽表格并结合松手后即时应用列宽实现。
+ * - buildColWidthsFromMemory: 已移除。
+ * - _updateOverwritePackage: 已移除，由 getOrComputeOverwritePackage 统一管理。
+ * - refreshAndSyncFile: 已移除，由 syncTableMemoryToSettings + scheduleFileSave 替代。
+ * - syncFileMemoryToData: 已移除，由 syncTableMemoryToSettings 替代。
+ * - debouncedSave: 已移除，由 scheduleFileSave 替代。
+ * - this.saveTimeout: 已移除，不再使用。
+ * - this.tableIndexCache: 已移除，不再使用。
+ * - 类外独立函数 scheduleFileSave: 已删除，统一使用类方法。
+ * - 阅读模式列宽维持: `tableResizePostProcessor` 及其注册已注释，`getTableRowNumbers` 已注释。阅读模式下不再干预表格渲染，完全由 Obsidian 原生控制。
+ * 
+ * 
+ * [性能优化] 重新打开文件时无需异步刷新 settings，直接使用 this.settings 对象。
+ * [修复跳动] 样式写入前比对当前值，相同则跳过。
+ * [修复自适应保存] 拖动最后一列直接保存显示宽度。
+ * [自适应顺滑优化] 1→实际宽度替换。
+ * [内存完整性修复] 内存数量与 rowNumbers 一致性校验，缺失表格自动补全。
+ * [调试日志] 缓存日志、数据日志、安全日志分级控制。
+ * [首次铺满优化] onLayoutReady 立即应用列宽。
+ * [切换文件优化] active-leaf-change 直接触发扫描调度。
+ * [拖拽保护锁] _isDragging 标志，拖拽中禁止自动干预；拖拽期间扫描器挂起；锁释放使用 try/finally 确保，即使文件被锁定拖拽也能恢复。
+ * [空扫描不写磁盘] rowNumbers===0 时绝不清空磁盘数据。
+ * [覆写数据整合包] 按视图缓存显示列宽与固定总宽度，消除乒乓问题，异步等待避免闪烁。
+ * [安全日志] securityLog 始终输出，记录窗口识别、数据拦截等重要事件。
+ * [窗口识别] 通过 leaf.getRoot() 与 workspace.rootSplit 比较，100% 准确。
+ * [模式延迟加载] 常规模式额外功能（文件关闭检测等）延迟到首次主窗口叶子出现时加载，支持后续补加载。
+ * [硬性防护] 拖拽保存入口检查窗口身份，非主窗口立即返回，杜绝拖拽数据污染。源码扫描更新和持久化已全面放开。
+ * [扫描调度] 源码扫描与列宽应用完全分离，前者由编辑驱动，后者独立定时，大幅降低 CPU 占用。
+ * [停摆模式] 列宽应用扫描器无表格时自动 idle，节省资源；失去焦点时降为 low，保证分屏列宽维护。
+ * [日志精简] 强制日志少而精，动态序号日志仅变化时输出，指纹匹配日志仅首次输出，内存写入日志受 debug 控制；MISS 日志去重。
+ * [结构变化判定] 仅以分隔行数量变化作为结构变化判据，不包含行号偏移，避免无谓的匹配迁移。
+ * [维护模式放宽] 新窗口允许源码扫描触发的内存更新和磁盘保存，仅禁止拖拽直接修改列宽。
+ * [窗口身份日志去重] 以视图（ScanState.lastWinIdentity）为粒度记录上次身份，仅在身份变化时输出日志，消除多视图共存时因文件级去重导致的日志抖动。
+ * [按需保存] scheduleFileSave 在列宽数据实际变更时调用（包括新窗口中的合法变更），防抖延迟 6 秒。
+ * [性能自检] 调试模式下启用 console.count 与 _perfStats 聚合输出，可直观判断插件自身活动频率是否健康。
+ * [手柄同步前置] 列宽扫描器在请求覆写数据前即确保主窗口表格有拖拽手柄，保证拖拽操作无延迟。
+ * [表格识别升级] 通过定位第一个 '|' 判断分隔行，区分普通表格与非普通表格，精确控制列宽应用。
+ * [打开文档保护] 文档总行数 < 3 时不启动任何扫描器，防止 Obsidian 未就绪时错误操作。
+ * [手柄前置] 主窗口表格无论有无覆写数据，立即拥有拖拽手柄，保证交互实时性。
+ * [异步等待覆写] 列宽扫描器通过 promise 等待覆写数据，拖动期间挂起，无死循环。 (已简化为询问拖动锁跳过)
+ * [数据结构适配] _rowNumbersCache 现已存储对象数组，所有读取行号的地方均使用 .rowNumber。
+ * [跨视图覆写包失效] 拖拽结束后调用 invalidateOverwritePackageForFile 清除其他视图的覆写包，并立刻为受影响的视图运行一次列宽应用，使新窗口列宽同步并即时刷新。此次调用为一次性，不改变扫描器模式。
+ * [低效模式延迟降级] 编辑后不立即降为 low，需连续两次扫描字符数变化均小于13才降级，防止行列增删时列宽恢复延迟。
+ * [光标点击检测] pointerdown 事件仅当光标位于表格内时才将列宽应用扫描器提升为 high，避免非表格区域点击浪费性能。
+ * [编辑后即时列宽覆写] editor-change 事件额外用 rAF 调用 processEditorTables，编辑后立即恢复列宽，消除闪烁。
+ * [拖拽恢复即时响应] 移除悬停激活机制，指针按下即拖拽，无延迟。在 `onMove` 中临时解除表格宽度锁定，松手后恢复。
+ * [临时模式适配] setupTableResize 中 isTemporary 分支已适配新版 attachDragBehavior 签名，直接传入 table，避免调用签名错误。 (注：setupTableResize 已移除，临时模式通过其他路径处理)
+ * [分屏维护] active-leaf-change 时其他视图降为 low 而非 idle，保证分屏场景下列宽持续维护。覆写包清空后的一次性列宽应用不会唤醒 idle 视图。
+ * [列宽覆写日志] applyWidthsToTable 增加调试日志，记录每次写入前后宽度变化，便于追踪列宽重置问题。
+ * [权威数据库回写] 从磁盘恢复列宽数据时，必须写回权威内存数据库，确保覆写包清空后仍能重建正确数据。新窗口同样执行。
+ * [表格宽度锁定] 通过设置表格的 min-width 和 width 样式，防止浏览器因容器宽度不足而压缩列宽，支持自适应铺满时扩展至编辑区宽度。拖拽时由 `attachDragBehavior` 临时解锁。
+ * [覆写包扩展] 覆写数据整合包新增 totalFixedWidth 字段，列宽应用扫描器可直接使用该值锁定表格总宽度。
+ * [实际渲染宽度按需阻塞查询] 新增 fetchActualColumnWidth 函数，在表格不在视口时阻塞等待，一旦出现立即获取实际渲染宽度，用于自适应替换和总宽度计算。
+ * [自适应替换与总宽度计算整合] 在计算 totalFixedWidth 时同步完成权威数据中 1→实际渲染宽度的替换，简化流程，消除硬编码默认值导致的表格扭曲。
+ * [全列宽数据整数化] 权威数据、覆写数据包、DOM 写入的列宽值均强制为整数。写入前比较时也使用整数比较，彻底避免浮点精度导致的重复写入死循环。
+ * [总宽度计算修正] 覆写包中的 totalFixedWidth 在自适应铺满且编辑区宽度大于固定列宽总和时，直接取编辑区宽度，确保 min-width 与实际显示总宽度一致，消除布局冲突导致的交替写入。
+ * [扫描模式切换稳定性] 视图失去焦点时降为 low 而非 idle，避免分屏场景下无法恢复列宽；仅连续 10 次无表格时进入 idle。覆写包清空后的一次性列宽应用不改变扫描模式。
+ * [拖拽解锁宽度限制] 拖拽时在 `onMove` 中临时设置 `min-width: 0` 和 `width: auto`，使表格在拖拽过程中可以自由缩放，解决向左拖拽最右侧列时无法收缩的问题。松手后列宽应用扫描器自动重新锁定。
+ * [分隔行缓存文件共享] 分隔行缓存改为文件级别，同一文件所有视图共享，减少冗余扫描；视图关闭时不清理。
+ * [源码扫描休眠] 文件无表格时自动休眠，累计行数变化≥3临时唤醒；仅活跃视图驱动，避免多视图干扰。
+ * [视图卸载清理] 视图关闭时彻底清除覆写包、扫描状态、观察者、事件监听器等视图独有资源，防止内存泄漏。
+ * [跨视图覆写包失效范围修正] invalidateOverwritePackageForFile 只会清空属于同一文件的其他视图缓存，避免误删其他文件的缓存引起不必要的重算。
+ * [安全获取文件路径] 新增 getFilePathFromCmView 辅助函数，通过遍历 leaves 安全获取 cmView 对应的文件路径，避免调用不存在的方法。
+ * [扫描模式 high 刷新] _setApplyScanMode 现在支持重复传入 'high'，即使当前已是 high 也会重置高效计时器和扫描间隔，以应对拖拽、滚动等高频事件。
+ * [拖拽扫描增强] attachDragBehavior 在拖拽开始时强制提升为 high，松手后再次提升为 high 并立即执行 processEditorTables 恢复宽度锁定。
+ * [移除残留等待队列] _pendingOverwriteResolvers 已从构造函数、拖拽流程中完全移除，简化了并发控制逻辑。
+ * [移动列检测] 新增 lastFpd 字段，在指纹B不变时通过比较原始标题顺序检测列移动，触发列宽重建和宽度锁定解除。经测试验证，移动列操作会触发 editor-change 事件，因此移动列会被源码扫描器正常捕获并处理。
+ * [批量加载防丢失] getOrComputeOverwritePackage 在单表格缺失时一次性加载整个文件的所有表格数据到内存，防止只恢复单个表格导致同步时丢失其他表格数据。
+ * [数据完整性保证] performSourceScan 末尾检查内存中的表格数量是否与源码一致，缺失则自动补全默认数据块，并同步 settings、触发保存。该操作在所有窗口执行。
+ * [MISS 日志去重] 引入 _missingLogged 记录已输出 MISS 的表格，每个缺失表格仅输出一次日志，大幅削减刷屏。
+ * [持久化统一] 所有权威数据更新均通过 syncTableMemoryToSettings + scheduleFileSave，无直接写盘。
+ * [拖拽保护锁释放增强] 在 attachDragBehavior 的 onUp 中，将 plugin._isDragging = false 移动到 try...finally 块之后执行，确保即使文件被锁定拖拽或发生异常，扫描器也能恢复正常工作。
+ * [指纹B变化处理修正] 当新旧指纹B内容不同时，仅更新内存 fingerprintB 和 widths 映射，不触发列宽重建，避免标题重命名时宽度被错误重新分配。移动列检测仅在指纹B内容相同时进行。
+ * [isNormalTable 修正] scanTableRowNumbers 中 isNormalTable 的判断现在使用 `line[0] === '|'`，精确检测行首是否为管道符，符合设计定义。
+ * [文件重命名放宽] vault.on("rename") 移除了 _regularModeLoaded 检查，确保任何窗口中发生的文件重命名都能正确更新 settings 和 tableMemory 中的路径信息。
+ * [保存路径放宽] saveSettings、scheduleFileSave、releaseFileMemory、getOrComputeOverwritePackage 中的保存条件均已放宽，不再区分主/新窗口，以支持源码扫描引起的全量数据更新。
+ * [独立函数清理] 删除了类外部的冗余 scheduleFileSave 独立函数，统一使用类方法，避免了代码重复和潜在的不一致风险。
+ * [源码扫描活跃窗口限制] 新增 `performSourceScan` 入口活跃叶子检查，仅当 `cmView` 属于当前激活的 Markdown 叶子时才执行扫描，避免分屏或多窗口环境下的重复扫描与覆写包错误清空。
+ * [阅读模式处理移除] 将 `tableResizePostProcessor`、其注册调用以及辅助方法 `getTableRowNumbers` 注释掉，阅读视图不再由插件管理列宽。相关描述已从注释中标记为已移除，保留代码以便将来恢复。
+ * [精确匹配 widths 重建] matchAndMigrateTablesForFile 中，精确匹配成功时不再直接复制 widths，而是调用 buildWidthsFromColWidths 根据当前标题顺序和 colWidths 重建 widths，确保 widths 与 colWidths 保持一致，修复手动修改 data.json 后可能出现的不一致问题。
+ * [防误触模式 2] 新增 `table: 2` 和 `cssclasses: ["2"]` 支持，效果为仅禁止拖拽但保留列宽应用。与 `"0"` 联合使用时降级 `"0"` 为仅禁止拖拽，避免完全禁用插件。
+ * 
+ * 
+ * 【关键注意事项 - 必须严格遵守】
+ * 1. 行号只用于确定序号，不得缓存或绑定表格身份。每次编辑事件都需重新扫描 rowNumbers。
+ * 2. 结构变化判断绝对不能包含行号变化或标题内容变化，只能依赖表格数量和列数序列。
+ * 3. 编辑标题时，指纹变化但列数未变 -> 只更新内存指纹和 widths，不触发列宽重建。
+ * 4. 匹配时权威数据可被多个当前表格共享 (处理复制表格)。
+ * 5. 侧边栏检测: 通过 table.closest('.markdown-source-view') 等排除文档视图。
+ * 6. 防抖保存时使用编辑器最新内容刷新指纹，避免读取磁盘旧文件。
+ * 7. 调试日志由全局 debugMode 控制。securityLog 始终输出。
+ * 8. 指纹B使用完整标题 (不截取，与 widths 键保持一致)。
+ * 9. 表格信息的收集必须基于分隔行扫描，绝不能依赖 DOM 数量。
+ * 10. 匹配迁移时，权威数据的 colWidths 直接复制使用。**精确匹配时 widths 将基于 colWidths 和当前标题重建。**
+ * 11. 文档是否包含表格，以源码分隔行数量为准。
+ * 12. 阅读模式：插件已移除阅读模式下的列宽维持功能（相关代码已注释），阅读视图中的表格由 Obsidian 原生渲染控制。
+ * 13. 自适应铺满首次将 1 替换为实际宽度并持久化（取整），现在所有窗口均会触发此替换和保存。
+ * 14. cssclasses 含 "0" 且不含 "1" 和 "2" 完全禁用；含 "1" 启用自适应；含 "2" 仅禁止拖拽；同时存在 "0" 和 "2" 时 "0" 降级为仅禁止拖拽。
+ * 15. 使用行号定位确定动态序号，不再依赖 DOM 顺序。
+ * 16. 空标题处理：从分隔行推断列数，生成全 null 指纹。
+ * 17. 应用列宽时先检测当前样式（整数比较），数值相同时跳过写入。
+ * 18. 必须确保表格最终拥有 `table-layout: fixed` 样式，但仅在缺少或值不同时才设置。
+ * 19. 文件关闭检测使用 active-leaf-change + 3s 延迟确认（常规模式专用）。
+ * 20. 尺寸监控：ResizeObserver 防抖，仅当尺寸真正改变才清空本视图覆写包并重算。
+ * 21. editorWidth 无效时 (<100px) 不计算补偿。
+ * 22. 首次应用使用 onLayoutReady，严禁在 onload 中直接调用 processEditorTables。
+ * 23. allowReplaceOnes 已废弃，自适应替换整合至 totalFixedWidth 计算流程。
+ * 24. active-leaf-change 中直接触发列宽应用扫描器的高效模式，并检查是否需启动源码扫描。
+ * 25. 拖拽互斥锁：_dragLock 控制，拖动开始设置，拖动结束更新覆写包并 resolve 等待，使用 try/finally 确保锁释放。新窗口（维护模式）禁止拖拽保存。**拖拽已恢复即时响应，无延迟和阈值，且拖拽过程中临时解锁表格宽度。拖拽开始/结束均会强制提升扫描模式为 high。拖拽期间列宽应用扫描器完全挂起。**
+ * 26. rowNumbers.length === 0 时绝不清空磁盘数据。所有窗口均可执行匹配迁移和数据补全。
+ * 27. 覆写数据整合包仅用于展示，编辑区宽度变化时仅清空本视图的缓存；拖拽后调用 invalidateOverwritePackageForFile 清空其他视图包并立即刷新列宽。**数据恢复后必须写回权威数据库。** **跨视图失效仅限相同文件，避免误删其他文件缓存。**
+ * 28. 缓存更新策略：计算后覆盖，命中时若宽度不同则更新记录。
+ * 29. 列宽应用扫描器负责处理虚拟滚动下的表格，取代所有失效的被动监听。维护/常规模式均运行。
+ * 30. 行号定位表格序号：使用 posAtDOM 和分隔行缓存，失败时回退到短指纹C。**必须使用 rowNumbers[i].rowNumber 进行比较。**
+ * 31. 列宽应用扫描器不执行匹配迁移等重量级操作，仅应用列宽。
+ * 32. 所有扫描器需在插件卸载或视图关闭时清理定时器和事件监听。
+ * 33. [窗口身份检测] 通过 leaf.getRoot() === workspace.rootSplit 判断，100%准确。
+ * 34. [维护模式] 允许源码扫描触发的内存/磁盘更新，**禁止拖拽直接修改列宽**，强制移除拖拽手柄。
+ * 35. [手柄管理] 列宽扫描器每次处理表格时根据窗口身份同步手柄，不再使用全局定时器。手柄同步前置，无论有无列宽数据均确保手柄状态正确。
+ * 36. [硬性防护] 拖拽保存入口检测窗口身份，非主窗口叶子触发立即返回。源码扫描及后续持久化已全面放开。
+ * 37. [常规模式加载] 首次主窗口叶子出现时加载文件关闭检测等额外功能，仅一次；支持在 processEditorTables / active-leaf-change 中补加载。
+ * 38. [事件常驻] editor-change、active-leaf-change、ResizeObserver 等事件始终运行，回调内分流模式。
+ * 39. [身份判断] 只使用 leaf.getRoot() 与 workspace.rootSplit 的比较，不使用任何 DOM 或通信方式。
+ * 40. [覆写数据包权限] 维护模式也允许更新本视图的覆写包，确保自适应展示正确。
+ * 41. [扫描调度] 源码扫描事件驱动，列宽扫描独立定时，editor-change 仅触发源码扫描，但额外用 rAF 触发一次即时列宽覆写。
+ * 42. [停摆模式] 列宽应用扫描器无表格时自动 idle，唤醒后从 high 恢复。视图失去焦点不进入 idle，只降为 low。
+ * 43. [动态序号日志] 仅当表格结构或标题内容变化时输出，使用源码标题而非指纹。
+ * 44. [指纹匹配日志] 每个文件仅首次输出完整匹配日志，后续静默。
+ * 45. [内存写入日志] 受 debugMode 控制，输出动态序号和标题。
+ * 46. [强制日志] data 读/写、窗口身份变化（由 ScanState.lastWinIdentity 去重）、安全拦截始终输出，不受 debugMode 限制。
+ * 47. [首次匹配] 完成首次 matchAndMigrateTablesForFile 后不再自动触发，除非结构变化。
+ * 48. [停摆恢复] 恢复时保持 initialMatchDone、firstEditOccurred 等标志，不重置。
+ * 49. [稳定计数器] 仅维护模式下使用，基于全部表格已应用列宽且内容哈希不变则累加，达到阈值进入 idle。
+ * 50. [结构变化判据] 仅比较分隔行数量变化，不计行号偏移。
+ * 51. [维护模式放宽] 新窗口允许源码扫描引发的所有内存和磁盘更新，但禁止拖拽列宽。
+ * 52. [窗口身份日志去重] 视图级 lastWinIdentity，避免同文件多视图身份日志反复切换。
+ * 53. [按需保存] scheduleFileSave 在列宽数据实际变更时调用（包括新窗口），防抖 6 秒。
+ * 54. [源码扫描驱动] 由 editor-change 驱动，无定时循环，文档无表格时休眠。经测试验证，移动列操作会触发 editor-change 事件，因此移动列会被正常捕获并处理。**严格限制仅活跃窗口执行源码扫描。**
+ * 55. [表格识别升级] 分隔行检测改为定位第一个 '|'，区分普通表格与非普通表格，isNormalTable 使用 `line[0] === '|'`。
+ * 56. [行数保护] 文档行数 < 3 时拒绝启动任何扫描器，防止 Obsidian 未就绪误操作。
+ * 57. [手柄前置] 主窗口表格无论有无覆写数据，立即拥有拖拽手柄，保证交互实时性。
+ * 58. [异步等待覆写] 列宽扫描器通过 promise 等待覆写数据，拖动期间挂起，无死循环。 (已简化为询问拖动锁跳过)
+ * 59. [数据结构适配] _rowNumbersCache 现已存储对象数组，所有读取行号的地方均使用 .rowNumber。
+ * 60. [跨视图覆写包失效] 拖拽结束后调用 invalidateOverwritePackageForFile 清除其他视图的覆写包，并立刻为受影响的视图安排一次列宽应用，确保多视图宽度同步刷新。该调用不改变扫描模式。
+ * 61. [低效模式延迟降级] 编辑后不立即降为 low，需连续两次扫描字符数变化均小于13才降级，防止行列增删时列宽恢复延迟。
+ * 62. [光标点击检测] pointerdown 事件仅当光标位于表格内时才将扫描器提升为 high，避免非表格区域点击浪费性能。
+ * 63. [编辑后即时列宽覆写] editor-change 事件额外用 rAF 调用 processEditorTables，编辑后立即恢复列宽，消除闪烁。
+ * 64. [拖拽即时响应] 移除悬停激活延迟，指针按下即启动拖拽流程，onMove 直接应用宽度并临时解锁表格宽度，onUp 保存数据，所有宽度值均取整。
+ * 65. [临时模式手柄适配] 临时模式手柄添加已适配新版 attachDragBehavior 签名，传入完整 table 元素及 mdView。
+ * 66. [分屏列宽维护] active-leaf-change 时将其他视图降为 low 而非 idle，保证分屏场景下非活动视图的列宽仍能被低频维护，避免列宽永久复位。覆写包清空后的一次性列宽应用不会唤醒 idle 视图。
+ * 67. [表格宽度锁定] 在 applyWidthsToTable 中设置表格的 min-width 和 width 样式，锁定表格总宽度，防止浏览器因容器宽度不足而压缩列宽。自适应铺满时宽度可扩展至编辑区宽度。拖拽时由 attachDragBehavior 的 onMove 临时解锁（min-width: 0, width: auto），松手后下次 applyWidthsToTable 恢复锁定。
+ * 68. [覆写包结构扩展] 覆写数据整合包存储的对象包含 widths 和 totalFixedWidth，列宽应用扫描器可直接使用这些数据。
+ * 69. [权威数据库回写] 从磁盘恢复列宽数据时必须写回权威内存数据库，确保覆写包清空后能从权威数据重建正确列宽，防止分屏/重绘导致列宽丢失且永不恢复。该操作在所有窗口执行。
+ * 70. [按需阻塞查询实际渲染宽度] fetchActualColumnWidth 函数在表格不在视口时阻塞等待，一旦表格出现立即返回其列宽（取整），避免空循环。用于自适应替换和 totalFixedWidth 计算。
+ * 71. [自适应替换与总宽度计算整合] 在 getOrComputeOverwritePackage 中，通过 fetchActualColumnWidth 一次性完成自适应列的 1→实际值替换和固定列宽总和计算，再根据自适应铺满规则确定 totalFixedWidth。
+ * 72. [全列宽数据整数化] 所有列宽值（权威数据、覆写包、DOM 写入）强制为整数。读取、比较、写入时均进行整数转换，彻底消除浮点精度导致的重复写入死循环。
+ * 73. [总宽度计算修正] 覆写包 totalFixedWidth 在开启自适应铺满时直接取 max(固定列宽总和, 编辑区宽度)，确保 min-width 与显示总宽度一致，消除布局冲突引起的交替写入。
+ * 74. [扫描模式切换稳定性] 视图失去焦点时降为 low 而非 idle，避免分屏场景下无法恢复列宽；仅连续 10 次无表格时进入 idle。覆写包清空后的一次性列宽应用不改变扫描模式。
+ * 75. [拖拽解锁宽度限制] 拖拽时在 onMove 中临时设置 `min-width: 0` 和 `width: auto`，使表格在拖拽过程中可以自由缩放，解决向左拖拽最右侧列时无法收缩的问题。松手后列宽应用扫描器自动重新锁定。
+ * 76. [分隔行缓存文件共享] 分隔行缓存按文件路径存储，所有视图共享，减少冗余；视图关闭时不清理。
+ * 77. [源码扫描休眠] 文件无表格时进入 dormant 模式，停止扫描，累计行数变化 ≥3 唤醒检查；仅活跃视图驱动，多视图一致。
+ * 78. [视图卸载清理] 视图关闭时需彻底清除覆写包、扫描状态、ResizeObserver、事件监听等该视图独有资源，防止内存泄漏。
+ * 79. [跨视图覆写包失效范围修正] invalidateOverwritePackageForFile 只会清空属于同一文件的其他视图缓存，避免误删其他文件的缓存导致全量重算和闪烁。
+ * 80. [扫描模式 high 刷新] _setApplyScanMode 现支持重复调用 'high' 以重置计时器，用于拖拽开始/结束等需要立即强化扫描的场景。
+ * 81. [拖拽扫描增强] 拖拽开始时强制提升为 high，拖拽期间扫描器挂起（不遍历表格），松手后执行 requestAnimationFrame(processEditorTables) 并再次提升为 high，保证宽度锁定即时恢复，无需等待下一次扫描周期。
+ * 82. [残留等待队列移除] _pendingOverwriteResolvers 已完全移除，相关逻辑已被询问拖动锁和松手即时应用取代。
+ * 83. [移动列检测] 通过 lastFpd 比较原始标题顺序，即使指纹B相同也能识别列移动，触发列宽重建和宽度锁定解除。经测试验证，移动列操作会触发 editor-change 事件，因此移动列会被源码扫描器正常捕获并处理。
+ * 84. [批量加载防丢失] getOrComputeOverwritePackage 在单表格缺失时，若磁盘有该文件数据，则一次性加载所有表格到内存，防止部分同步覆盖。
+ * 85. [数据完整性保证] performSourceScan 末尾检查并补全内存中缺失的表格数据块，仅添加缺失序号，不覆盖已有。
+ * 86. [MISS 日志去重] _missingLogged 记录已输出 MISS 的表格，每个缺失表格仅输出一次日志，数据加载成功后自动清除。
+ * 87. [持久化统一] 所有权威数据更新均通过 syncTableMemoryToSettings + scheduleFileSave，无直接写盘；已移除未使用的 syncFileMemoryToData、debouncedSave、saveTimeout、tableIndexCache。
+ * 88. [结构变化时清空当前视图覆写包] performSourceScan 在结构变化（表格数量变化）时，不仅调用 removeAllTableMinWidth 和 invalidateOverwritePackageForFile，也显式 delete 当前视图的覆写包，与列数变化分支保持一致。
+ * 89. [拖拽保护锁释放增强] 在 attachDragBehavior 的 onUp 回调中，将 plugin._isDragging = false 移到 try...finally 块之后执行，确保即使文件被锁定拖拽（isDragLocked 返回 true）或发生异常，扫描器也能恢复正常工作，不会永久挂起。
+ * 90. [移动列事件验证] 经专门测试插件验证，Obsidian 中移动表格列操作会触发 workspace.on('editor-change') 事件，因此源码扫描器能及时检测到列顺序变化，无需额外的定时扫描或 DOM 监听来捕获移动列操作。
+ * 91. [指纹B变化处理修正] 当新旧指纹B内容不同时，仅更新内存指纹和 widths 映射，不触发列宽重建；移动列检测仅在指纹B内容相同时进行。这避免了标题重命名时宽度被错误重新分配，确保宽度绑定列位置。
+ * 92. [isNormalTable 修正] 判断改为 `line[0] === '|'`，不再使用 trimStart，确保有前导空格的表格不被误判为普通表格。
+ * 93. [文件重命名放宽] vault.on("rename") 移除了 _regularModeLoaded 检查，新窗口重命名文件也能正确更新所有相关路径。
+ * 94. [保存权限全面放宽] saveSettings、scheduleFileSave、releaseFileMemory 中不再检查 _regularModeLoaded，允许新窗口中的源码扫描更新和自适应替换结果写入磁盘。
+ * 95. [类外函数清理] 删除了顶部多余的独立 scheduleFileSave 函数，避免与类方法冲突。
+ * 96. [源码扫描活跃窗口限制] performSourceScan 新增活跃叶子检查，仅当 cmView 属于当前激活的 Markdown 叶子时才执行扫描，避免分屏、多窗口环境下非活跃视图重复执行匹配迁移、清空覆写包。
+ * 97. [阅读模式移除] 插件不再维持阅读模式列宽，相关代码（tableResizePostProcessor、registerMarkdownPostProcessor 调用、getTableRowNumbers）已注释保留，方便日后恢复。阅读视图表格样式完全交由 Obsidian 默认处理。
+ * 98. [精确匹配 widths 重建] matchAndMigrateTablesForFile 精确匹配分支改为调用 buildWidthsFromColWidths 重建 widths，确保数据一致性。
+ * 99. [防误触模式 2] isDragLocked 识别 table:2 和 cssclasses:["2"]；isPluginFullyDisabled 在同时存在 "0" 和 "2" 时不再完全禁用，仅降级为禁止拖拽。
+ */

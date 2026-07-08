@@ -1,8 +1,8 @@
 {
   "id": "table-column-control",
   "name": "列宽控制（Table Column Control）",
-  "version": "1.0.0",
-  "minAppVersion": "1.12.0",
+  "version": "2.0.0",
+  "minAppVersion": "1.10.0",
   "description": "拖动控制列宽，基于「Table Column Resize」（原作者lolieatapple），使用 AI 编程改动。数据与 Table Column Resize 不共享。",
   "author": "yzu309",
   "authorUrl": "https://github.com/yzu309",

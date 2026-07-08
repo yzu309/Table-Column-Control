@@ -1,23 +1,23 @@
-/* Table Column Resize plugin styles */
-
-/* Ensure resized tables use fixed layout so col/th widths are honored.
-   !important is required to beat Obsidian core / theme rules that set
-   table-layout: auto with high specificity. */
+/* 确保调整过列宽的表格使用固定布局，以便 col/th 的宽度设置生效。
+   使用 !important 是为了覆盖 Obsidian 核心或主题中可能的高优先级 auto 布局。 */
 table[data-tcr] {
   table-layout: fixed !important;
-  width: 100% !important;
+  /* 注意：表格的 width 和 min-width 由插件 JS 根据列宽数据和自适应铺满动态控制，
+     所以这里不写死 width，避免覆盖 JS 行为。 */
 }
 
-/* Drag handle: positioned at the right edge of each header cell */
+/* 让表头单元格允许绝对定位的手柄超出显示 */
 table[data-tcr] th,
 table[data-tcr] td {
   overflow: visible;
 }
 
+/* 表头单元格设为相对定位，作为拖拽手柄的定位参考 */
 table[data-tcr] th {
   position: relative;
 }
 
+/* 拖拽手柄：位于每个表头单元格的右边缘 */
 .tcr-handle {
   position: absolute;
   top: 0;
@@ -30,23 +30,29 @@ table[data-tcr] th {
   -webkit-user-select: none;
 }
 
-/* Visual feedback on hover */
+/* 鼠标悬停时的视觉反馈 */
 .tcr-handle:hover {
   background-color: var(--interactive-accent);
   opacity: 0.4;
   border-radius: 2px;
 }
 
-/* Active dragging state */
+/* 拖拽进行中的手柄高亮 */
 .tcr-handle.tcr-dragging {
   background-color: var(--interactive-accent);
   opacity: 0.6;
 }
 
-/* Suppress cursor/selection changes while dragging */
+/* 拖拽过程中全局禁止文本选中并保持拖拽光标 */
 body.tcr-resizing,
 body.tcr-resizing * {
   cursor: col-resize !important;
   user-select: none !important;
   -webkit-user-select: none !important;
+}
+
+/* 移除 Obsidian 对表格容器的最大宽度限制，允许表格在编辑/阅读模式下自由扩展 */
+.markdown-source-view .cm-table-widget .table-wrapper,
+.markdown-reading-view .markdown-preview-view .table-wrapper {
+  max-width: none !important;
 }
